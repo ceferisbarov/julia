@@ -601,10 +601,10 @@ function visit_slot_load!(sl::SlotNumber, vtypes::VarTable, sv::InferenceState, 
         # find used-undef variables
         undefs[id] = true
     end
-    # add type annotations where needed
-    if !(sv.slottypes[id] ⊑ vt)
-        return TypedSlot(id, vt)
-    end
+    # TODO add type annotations where needed
+    # if !(sv.slottypes[id] ⊑ vt)
+    #     return TypedSlot(id, vt)
+    # end
     return sl
 end
 
@@ -612,17 +612,14 @@ function record_slot_assign!(sv::InferenceState)
     # look at all assignments to slots
     # and union the set of types stored there
     # to compute a lower bound on the storage required
-    states = sv.stmt_types
     body = sv.src.code::Vector{Any}
     slottypes = sv.slottypes::Vector{Any}
     ssavaluetypes = sv.src.ssavaluetypes::Vector{Any}
     for i = 1:length(body)
         expr = body[i]
-        st_i = states[i]
         # find all reachable assignments to locals
-        if isa(st_i, VarTable) && isa(expr, Expr) && expr.head === :(=)
+        if was_reached(sv, i) && isexpr(expr, :(=))
             lhs = expr.args[1]
-            rhs = expr.args[2]
             if isa(lhs, SlotNumber)
                 vt = widenconst(ssavaluetypes[i])
                 if vt !== Bottom
@@ -664,8 +661,7 @@ function type_annotate!(sv::InferenceState, run_optimizer::Bool)
     # annotate variables load types
     # remove dead code optimization
     # and compute which variables may be used undef
-    states = sv.stmt_types
-    nslots = length(states[1]::VarTable)
+    nslots = length(src.slotflags)
     undefs = fill(false, nslots)
     body = src.code::Array{Any,1}
     nexpr = length(body)
@@ -678,9 +674,9 @@ function type_annotate!(sv::InferenceState, run_optimizer::Bool)
                 # replace live GotoIfNot with:
                 # - GotoNode if the fallthrough target is unreachable
                 # - no-op if the branch target is unreachable
-                if states[idx+1] === nothing
+                if !was_reached(sv, idx+1)
                     body[idx] = GotoNode(stmt.dest)
-                elseif states[stmt.dest] === nothing
+                elseif !was_reached(sv, stmt.dest)
                     body[idx] = nothing
                 end
             end
@@ -693,10 +689,9 @@ function type_annotate!(sv::InferenceState, run_optimizer::Bool)
     changemap = fill(0, nexpr)
     while i <= nexpr
         oldidx += 1
-        st_i = states[i]
         expr = body[i]
-        if isa(st_i, VarTable)
-            # st_i === nothing  =>  unreached statement  (see issue #7836)
+        if was_reached(sv, oldidx)
+            st_i = sv.bb_vartables[block_for_inst(sv.cfg, oldidx)]
             if isa(expr, Expr)
                 annotate_slot_load!(expr, st_i, sv, undefs)
             elseif isa(expr, ReturnNode) && isdefined(expr, :val)
@@ -706,12 +701,11 @@ function type_annotate!(sv::InferenceState, run_optimizer::Bool)
             elseif isa(expr, SlotNumber)
                 body[i] = visit_slot_load!(expr, st_i, sv, undefs)
             end
-        else
+        else # unreached statement  (see issue #7836)
             if isa(expr, Expr) && is_meta_expr_head(expr.head)
                 # keep any lexically scoped expressions
             elseif run_optimizer
                 deleteat!(body, i)
-                deleteat!(states, i)
                 deleteat!(ssavaluetypes, i)
                 deleteat!(src.codelocs, i)
                 deleteat!(sv.stmt_info, i)
@@ -735,6 +729,7 @@ function type_annotate!(sv::InferenceState, run_optimizer::Bool)
             src.slotflags[j] |= SLOT_USEDUNDEF | SLOT_STATICUNDEF
         end
     end
+
     nothing
 end
 
