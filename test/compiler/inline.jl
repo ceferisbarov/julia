@@ -1259,3 +1259,22 @@ end
 @test fully_eliminated() do
     return maybe_error_int(1)
 end
+
+# Test that we can inline a finalizer for a struct that does not otherwise escape
+global total_deallocations::Int = 0
+
+mutable struct DoAllocNoEscape
+    function DoAlloc()
+        finalizer(new()) do this
+            global total_deallocations += 1
+        end
+    end
+end
+
+let src = code_typed1() do
+        for i = 1:1000
+            DoAllocNoEscape()
+        end
+    end
+    @test count(isnew, src.code) == 0
+end

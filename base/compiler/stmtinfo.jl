@@ -182,4 +182,14 @@ struct ReturnTypeCallInfo
     info::Any
 end
 
+"""
+    info::FinalizerInfo
+
+Represents a the information of a potential call to the finalizer on the given
+object type.
+"""
+struct FinalizerInfo
+    info::Any
+end
+
 @specialize

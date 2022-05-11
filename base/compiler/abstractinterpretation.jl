@@ -1590,6 +1590,16 @@ function invoke_rewrite(xs::Vector{Any})
     return newxs
 end
 
+function abstract_add_finalizer(interp::AbstractInterpreter, argtypes::Vector{Any}, sv::InferenceState)
+    if length(argtypes) == 3
+        tt = argtypes[3]
+        finalizer_argvec = Any[argtypes[3], argtypes[2]]
+        call = abstract_call(interp, ArgInfo(nothing, finalizer_argvec), sv, 1)
+        return CallMeta(Nothing, FinalizerInfo(call.info))
+    end
+    return CallMeta(Nothing, false)
+end
+
 # call where the function is known exactly
 function abstract_call_known(interp::AbstractInterpreter, @nospecialize(f),
         arginfo::ArgInfo, sv::InferenceState,
@@ -1607,6 +1617,8 @@ function abstract_call_known(interp::AbstractInterpreter, @nospecialize(f),
         elseif f === modifyfield!
             tristate_merge!(sv, Effects()) # TODO
             return abstract_modifyfield!(interp, argtypes, sv)
+        elseif f === Core._add_finalizer
+            return abstract_add_finalizer(interp, argtypes, sv)
         end
         rt = abstract_call_builtin(interp, f, arginfo, sv, max_methods)
         tristate_merge!(sv, builtin_effects(f, argtypes, rt))
