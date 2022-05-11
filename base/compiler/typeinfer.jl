@@ -565,49 +565,6 @@ function widen_all_consts!(src::CodeInfo)
     return src
 end
 
-function annotate_slot_load!(e::Expr, vtypes::VarTable, sv::InferenceState, undefs::Array{Bool,1})
-    head = e.head
-    i0 = 1
-    if is_meta_expr_head(head) || head === :const
-        return
-    end
-    if head === :(=) || head === :method
-        i0 = 2
-    end
-    for i = i0:length(e.args)
-        subex = e.args[i]
-        if isa(subex, Expr)
-            annotate_slot_load!(subex, vtypes, sv, undefs)
-        elseif isa(subex, SlotNumber)
-            e.args[i] = visit_slot_load!(subex, vtypes, sv, undefs)
-        end
-    end
-end
-
-function annotate_slot_load(@nospecialize(e), vtypes::VarTable, sv::InferenceState, undefs::Array{Bool,1})
-    if isa(e, Expr)
-        annotate_slot_load!(e, vtypes, sv, undefs)
-    elseif isa(e, SlotNumber)
-        return visit_slot_load!(e, vtypes, sv, undefs)
-    end
-    return e
-end
-
-function visit_slot_load!(sl::SlotNumber, vtypes::VarTable, sv::InferenceState, undefs::Array{Bool,1})
-    id = slot_id(sl)
-    s = vtypes[id]
-    vt = widenconditional(ignorelimited(s.typ))
-    if s.undef
-        # find used-undef variables
-        undefs[id] = true
-    end
-    # TODO add type annotations where needed
-    # if !(sv.slottypes[id] ⊑ vt)
-    #     return TypedSlot(id, vt)
-    # end
-    return sl
-end
-
 function record_slot_assign!(sv::InferenceState)
     # look at all assignments to slots
     # and union the set of types stored there
@@ -663,7 +620,7 @@ function type_annotate!(sv::InferenceState, run_optimizer::Bool)
     # and compute which variables may be used undef
     nslots = length(src.slotflags)
     undefs = fill(false, nslots)
-    body = src.code::Array{Any,1}
+    body = copy_exprargs(src.code::Array{Any,1})
     nexpr = length(body)
 
     # eliminate GotoIfNot if either of branch target is unreachable
@@ -684,6 +641,7 @@ function type_annotate!(sv::InferenceState, run_optimizer::Bool)
     end
 
     # dead code elimination for unreachable regions
+    ssavaluetypes = copy(ssavaluetypes)
     i = 1
     oldidx = 0
     changemap = fill(0, nexpr)
@@ -691,16 +649,7 @@ function type_annotate!(sv::InferenceState, run_optimizer::Bool)
         oldidx += 1
         expr = body[i]
         if was_reached(sv, oldidx)
-            st_i = sv.bb_vartables[block_for_inst(sv.cfg, oldidx)]
-            if isa(expr, Expr)
-                annotate_slot_load!(expr, st_i, sv, undefs)
-            elseif isa(expr, ReturnNode) && isdefined(expr, :val)
-                body[i] = ReturnNode(annotate_slot_load(expr.val, st_i, sv, undefs))
-            elseif isa(expr, GotoIfNot)
-                body[i] = GotoIfNot(annotate_slot_load(expr.cond, st_i, sv, undefs), expr.dest)
-            elseif isa(expr, SlotNumber)
-                body[i] = visit_slot_load!(expr, st_i, sv, undefs)
-            end
+            body[i] = annotate_slot_load!(undefs, oldidx, sv, body[i])
         else # unreached statement  (see issue #7836)
             if isa(expr, Expr) && is_meta_expr_head(expr.head)
                 # keep any lexically scoped expressions
@@ -730,7 +679,67 @@ function type_annotate!(sv::InferenceState, run_optimizer::Bool)
         end
     end
 
+    src.code = body
+    src.ssavaluetypes = ssavaluetypes
+
     nothing
+end
+
+function annotate_slot_load!(undefs::Vector{Bool}, idx::Int, sv::InferenceState, @nospecialize x)
+    if isa(x, Expr)
+        head = x.head
+        i0 = 1
+        if is_meta_expr_head(head) || head === :const
+            return x
+        end
+        if head === :(=) || head === :method
+            i0 = 2
+        end
+        for i = i0:length(x.args)
+            x.args[i] = annotate_slot_load!(undefs, idx, sv, x.args[i])
+        end
+        return x
+    elseif isa(x, ReturnNode) && isdefined(x, :val)
+        return ReturnNode(annotate_slot_load!(undefs, idx, sv, x.val))
+    elseif isa(x, GotoIfNot)
+        return GotoIfNot(annotate_slot_load!(undefs, idx, sv, x.cond), x.dest)
+    elseif isa(x, SlotNumber)
+        id = slot_id(x)
+        pc = find_dominating_assignment(id, idx, sv)
+        if pc === nothing
+            block = block_for_inst(sv.cfg, idx)
+            state = sv.bb_vartables[block]
+            vt = state[id]
+            if vt.undef
+                undefs[id] = true
+            end
+            typ = widenconditional(ignorelimited(vt.typ))
+        else
+            typ = sv.src.ssavaluetypes[pc]
+        end
+        # add type annotations where needed
+        if !(sv.slottypes[id] ⊑ typ)
+            return TypedSlot(id, typ)
+        end
+        return x
+    end
+    return x
+end
+
+# find the dominating assignment to the slot `id` in the block containing statement `idx`,
+# returns `nothing` otherwise
+function find_dominating_assignment(id::Int, idx::Int, sv::InferenceState)
+    block = block_for_inst(sv.cfg, idx)
+    for pc in reverse(sv.cfg.blocks[block].stmts) # N.B. reverse since the last assignement is dominating this block
+        pc < idx || continue # N.B. needs pc ≠ idx as `id` can be assigned at `idx`
+        stmt = sv.src.code[pc]
+        isexpr(stmt, :(=)) || continue
+        lhs = stmt.args[1]
+        isa(lhs, SlotNumber) || continue
+        slot_id(lhs) == id || continue
+        return pc
+    end
+    return nothing
 end
 
 # at the end, all items in b's cycle
