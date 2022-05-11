@@ -2313,21 +2313,27 @@ function typeinf_local(interp::AbstractInterpreter, frame::InferenceState)
                             # We continue with the true branch, but process the false
                             # branch here.
                             if isa(condt, Conditional)
-                                false_vartable = stoverwrite1!(copy(frame.pc_vartable),
-                                    conditional_changes(frame.pc_vartable, condt.elsetype, condt.var))
+                                else_changes = conditional_changes(frame.pc_vartable, condt.elsetype, condt.var)
+                                if else_changes !== nothing
+                                    false_vartable = stoverwrite1!(copy(frame.pc_vartable), else_changes)
+                                else
+                                    false_vartable = frame.pc_vartable
+                                end
                                 if falsebb in analyzed_bbs
                                     newstate = stupdate!(frame.bb_vartables[falsebb], false_vartable)
                                 else
-                                    newstate = frame.bb_vartables[falsebb] = stupdate!(nothing, false_vartable)
+                                    newstate = stoverwrite!(frame.bb_vartables[falsebb], false_vartable)
                                     push!(analyzed_bbs, falsebb)
                                 end
-                                stoverwrite1!(frame.pc_vartable,
-                                    conditional_changes(frame.pc_vartable, condt.vtype, condt.var))
+                                then_changes = conditional_changes(frame.pc_vartable, condt.vtype, condt.var)
+                                if then_changes !== nothing
+                                    stoverwrite1!(frame.pc_vartable, then_changes)
+                                end
                             else
                                 if falsebb in analyzed_bbs
                                     newstate = stupdate!(frame.bb_vartables[falsebb], frame.pc_vartable)
                                 else
-                                    newstate = frame.bb_vartables[falsebb] = stupdate!(nothing, frame.pc_vartable)
+                                    newstate = stoverwrite!(frame.bb_vartables[falsebb], frame.pc_vartable)
                                     push!(analyzed_bbs, falsebb)
                                 end
                             end
@@ -2382,7 +2388,7 @@ function typeinf_local(interp::AbstractInterpreter, frame::InferenceState)
                     if catchbb in analyzed_bbs
                         newstate = stupdate!(frame.bb_vartables[catchbb], frame.pc_vartable)
                     else
-                        newstate = frame.bb_vartables[catchbb] = stupdate!(nothing, frame.pc_vartable)
+                        newstate = stoverwrite!(frame.bb_vartables[catchbb], frame.pc_vartable)
                         push!(analyzed_bbs, catchbb)
                     end
                     if newstate !== nothing
@@ -2427,42 +2433,33 @@ function typeinf_local(interp::AbstractInterpreter, frame::InferenceState)
             end
         end # for frame.currpc in frame.currpc:bbend
 
-    # Case 1: Fallthrough termination
-    @label fallthrough
-        nextbb = frame.currbb + 1
-
-    # Case 2: Directly branch to a different BB
-    @label branch
-        if nextbb in analyzed_bbs
-            newstate = stupdate!(frame.bb_vartables[nextbb], frame.pc_vartable)
-        else
-            newstate = frame.bb_vartables[nextbb] = stupdate!(nothing, frame.pc_vartable)
-            push!(analyzed_bbs, nextbb)
+        # Case 1: Fallthrough termination
+        begin @label fallthrough
+            nextbb = frame.currbb + 1
         end
-        if newstate !== nothing || !was_reached(frame, first(bbs[nextbb].stmts))
-            push!(W, nextbb)
-        end
-        @goto find_next_bb
 
-        # TODO: Restore optimization
-        if nextbb <= nbbs
-            newstate = stupdate!(frame.bb_vartables[nextbb], frame.pc_vartable)
-            if newstate !== nothing
-                frame.currbb = nextbb
-                frame.currpc = first(bbs[nextbb].stmts)
-                stoverwrite!(frame.pc_vartable, newstate)
-                continue
+        # Case 2: Directly branch to a different BB
+        begin @label branch
+            if nextbb in analyzed_bbs
+                newstate = stupdate!(frame.bb_vartables[nextbb], frame.pc_vartable)
+            else
+                newstate = stoverwrite!(frame.bb_vartables[nextbb], frame.pc_vartable)
+                push!(analyzed_bbs, nextbb)
+            end
+            if newstate !== nothing || !was_reached(frame, first(bbs[nextbb].stmts))
+                push!(W, nextbb)
             end
         end
 
-    # Case 3: Control flow ended along the current path (converged, return or throw)
-    @label find_next_bb
-        frame.currbb = _bits_findnext(W.bits, 1)::Int # next basic block
-        frame.currbb == -1 && break # the working set is empty
-        frame.currbb > nbbs && break
+        # Case 3: Control flow ended along the current path (converged, return or throw)
+        begin @label find_next_bb
+            frame.currbb = _bits_findnext(W.bits, 1)::Int # next basic block
+            frame.currbb == -1 && break # the working set is empty
+            frame.currbb > nbbs && break
 
-        frame.currpc = first(bbs[frame.currbb].stmts)
-        stoverwrite!(frame.pc_vartable, frame.bb_vartables[frame.currbb])
+            frame.currpc = first(bbs[frame.currbb].stmts)
+            stoverwrite!(frame.pc_vartable, frame.bb_vartables[frame.currbb])
+        end
     end # while frame.currbb <= nbbs
 
     frame.dont_work_on_me = false
