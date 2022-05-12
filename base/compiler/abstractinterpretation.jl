@@ -2253,7 +2253,8 @@ function typeinf_local(interp::AbstractInterpreter, frame::InferenceState)
         frame.currbb = _bits_findnext(W.bits, 1)::Int # next basic block
     end
 
-    stoverwrite!(frame.pc_vartable, frame.bb_vartables[frame.currbb])
+    states = frame.bb_vartables
+    currstate = copy(states[frame.currbb])
     while frame.currbb <= nbbs
         delete!(W, frame.currbb)
         frame.currpc = first(bbs[frame.currbb].stmts)
@@ -2274,7 +2275,7 @@ function typeinf_local(interp::AbstractInterpreter, frame::InferenceState)
                     @goto branch
                 elseif isa(stmt, GotoIfNot)
                     condx = stmt.cond
-                    condt = abstract_eval_value(interp, condx, frame.pc_vartable, frame)
+                    condt = abstract_eval_value(interp, condx, currstate, frame)
                     if condt === Bottom
                         empty!(frame.pclimitations)
                         @goto find_next_bb
@@ -2313,31 +2314,31 @@ function typeinf_local(interp::AbstractInterpreter, frame::InferenceState)
                             # We continue with the true branch, but process the false
                             # branch here.
                             if isa(condt, Conditional)
-                                else_changes = conditional_changes(frame.pc_vartable, condt.elsetype, condt.var)
-                                if else_changes !== nothing
-                                    false_vartable = stoverwrite1!(copy(frame.pc_vartable), else_changes)
+                                else_change = conditional_change(currstate, condt.elsetype, condt.var)
+                                if else_change !== nothing
+                                    false_vartable = stoverwrite1!(copy(currstate), else_change)
                                 else
-                                    false_vartable = frame.pc_vartable
+                                    false_vartable = currstate
                                 end
                                 if falsebb in analyzed_bbs
-                                    newstate = stupdate!(frame.bb_vartables[falsebb], false_vartable)
+                                    newstate = stupdate!(states[falsebb], false_vartable)
                                 else
-                                    newstate = stoverwrite!(frame.bb_vartables[falsebb], false_vartable)
+                                    newstate = stoverwrite!(states[falsebb], false_vartable)
                                     push!(analyzed_bbs, falsebb)
                                 end
-                                then_changes = conditional_changes(frame.pc_vartable, condt.vtype, condt.var)
-                                if then_changes !== nothing
-                                    stoverwrite1!(frame.pc_vartable, then_changes)
+                                then_change = conditional_change(currstate, condt.vtype, condt.var)
+                                if then_change !== nothing
+                                    stoverwrite1!(currstate, then_change)
                                 end
                             else
                                 if falsebb in analyzed_bbs
-                                    newstate = stupdate!(frame.bb_vartables[falsebb], frame.pc_vartable)
+                                    newstate = stupdate!(states[falsebb], currstate)
                                 else
-                                    newstate = stoverwrite!(frame.bb_vartables[falsebb], frame.pc_vartable)
+                                    newstate = stoverwrite!(states[falsebb], currstate)
                                     push!(analyzed_bbs, falsebb)
                                 end
                             end
-                            if newstate !== nothing || !was_reached(frame, first(bbs[falsebb].stmts))
+                            if newstate !== nothing
                                 handle_control_backedge!(frame, frame.currpc, stmt.dest)
                                 push!(W, falsebb)
                             end
@@ -2346,8 +2347,8 @@ function typeinf_local(interp::AbstractInterpreter, frame::InferenceState)
                     end
                 elseif isa(stmt, ReturnNode)
                     bestguess = frame.bestguess
-                    rt = abstract_eval_value(interp, stmt.val, frame.pc_vartable, frame)
-                    rt = widenreturn(rt, bestguess, nargs, slottypes, frame.pc_vartable)
+                    rt = abstract_eval_value(interp, stmt.val, currstate, frame)
+                    rt = widenreturn(rt, bestguess, nargs, slottypes, currstate)
                     # narrow representation of bestguess slightly to prepare for tmerge with rt
                     if rt isa InterConditional && bestguess isa Const
                         let slot_id = rt.slot
@@ -2386,9 +2387,9 @@ function typeinf_local(interp::AbstractInterpreter, frame::InferenceState)
                     l = stmt.args[1]::Int
                     catchbb = block_for_inst(frame.cfg, l)
                     if catchbb in analyzed_bbs
-                        newstate = stupdate!(frame.bb_vartables[catchbb], frame.pc_vartable)
+                        newstate = stupdate!(states[catchbb], currstate)
                     else
-                        newstate = stoverwrite!(frame.bb_vartables[catchbb], frame.pc_vartable)
+                        newstate = stoverwrite!(states[catchbb], currstate)
                         push!(analyzed_bbs, catchbb)
                     end
                     if newstate !== nothing
@@ -2401,12 +2402,12 @@ function typeinf_local(interp::AbstractInterpreter, frame::InferenceState)
             end
             # Process non control-flow statements
             (; changes, type) = abstract_eval_basic_statement(interp,
-                stmt, frame.pc_vartable, frame)
+                stmt, currstate, frame)
             if type === Union{}
                 @goto find_next_bb
             end
             if changes !== nothing
-                stoverwrite1!(frame.pc_vartable, changes)
+                stoverwrite1!(currstate, changes)
                 let cur_hand = frame.handler_at[frame.currpc], l, enter
                     while cur_hand != 0
                         enter = frame.src.code[cur_hand]::Expr
@@ -2415,8 +2416,8 @@ function typeinf_local(interp::AbstractInterpreter, frame::InferenceState)
                         # propagate new type info to exception handler
                         # the handling for Expr(:enter) propagates all changes from before the try/catch
                         # so this only needs to propagate any changes
-                        if stupdate1!(frame.bb_vartables[exceptbb], changes) || !was_reached(frame, first(bbs[exceptbb].stmts))
-                            push!(frame.ip, exceptbb)
+                        if stupdate1!(states[exceptbb], changes)
+                            push!(W, exceptbb)
                         end
                         cur_hand = frame.handler_at[cur_hand]
                     end
@@ -2441,12 +2442,12 @@ function typeinf_local(interp::AbstractInterpreter, frame::InferenceState)
         # Case 2: Directly branch to a different BB
         begin @label branch
             if nextbb in analyzed_bbs
-                newstate = stupdate!(frame.bb_vartables[nextbb], frame.pc_vartable)
+                newstate = stupdate!(states[nextbb], currstate)
             else
-                newstate = stoverwrite!(frame.bb_vartables[nextbb], frame.pc_vartable)
+                newstate = stoverwrite!(states[nextbb], currstate)
                 push!(analyzed_bbs, nextbb)
             end
-            if newstate !== nothing || !was_reached(frame, first(bbs[nextbb].stmts))
+            if newstate !== nothing
                 push!(W, nextbb)
             end
         end
@@ -2458,7 +2459,7 @@ function typeinf_local(interp::AbstractInterpreter, frame::InferenceState)
             frame.currbb > nbbs && break
 
             frame.currpc = first(bbs[frame.currbb].stmts)
-            stoverwrite!(frame.pc_vartable, frame.bb_vartables[frame.currbb])
+            stoverwrite!(currstate, states[frame.currbb])
         end
     end # while frame.currbb <= nbbs
 
@@ -2466,14 +2467,14 @@ function typeinf_local(interp::AbstractInterpreter, frame::InferenceState)
     nothing
 end
 
-function conditional_changes(changes::VarTable, @nospecialize(typ), var::SlotNumber)
-    oldtyp = changes[slot_id(var)].typ
+function conditional_change(state::VarTable, @nospecialize(typ), var::SlotNumber)
+    oldtyp = state[slot_id(var)].typ
     # approximate test for `typ ∩ oldtyp` being better than `oldtyp`
     # since we probably formed these types with `typesubstract`, the comparison is likely simple
     if ignorelimited(typ) ⊑ ignorelimited(oldtyp)
         # typ is better unlimited, but we may still need to compute the tmeet with the limit "causes" since we ignored those in the comparison
         oldtyp isa LimitedAccuracy && (typ = tmerge(typ, LimitedAccuracy(Bottom, oldtyp.causes)))
-        return StateUpdate(var, VarState(typ, false), changes, true)
+        return StateUpdate(var, VarState(typ, false), state, true)
     end
     return nothing
 end
